@@ -1,0 +1,411 @@
+# Import all useful data modules
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import os
+import re
+import matplotlib.pyplot as plt
+import featexp
+import missingno
+import statsmodels.api as sm
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder, Imputer
+from sklearn.model_selection import cross_val_score, GridSearchCV
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.model_selection import train_test_split
+from sklearn.base import BaseEstimator, TransformerMixin
+
+# Import key regression models to test
+from sklearn.linear_model import LinearRegression, Lasso, Ridge, ElasticNet
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.svm import SVR, LinearSVR, NuSVR
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+
+# Define classes and function required later in the pipeline flow
+class ModelTransformer(TransformerMixin):
+    '''Wrapper to treat model as transformer - useful if using algo to generate feature for a future model
+    e.g. Using KNN to generate clusters for input into regression model'''
+    def __init__(self, model):
+        self.model = model
+
+    def fit(self, *args, **kwargs):
+        self.model.fit(*args, **kwargs)
+        return self
+
+    def transform(self, X, **transform_params):
+        return pd.DataFrame(self.model.predict(X))
+
+# Class to select the columns of a dataset that belong to a specified data-type
+class TypeSelector(TransformerMixin):
+    def __init__(self, dtype):
+        self.dtype = dtype
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        assert isinstance(X, pd.DataFrame)
+        return X.select_dtypes(include=[self.dtype])
+
+# Sklearn warppper for the pandas get_dummies function
+class GetDummiesEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, columns=None):
+        self.columns = columns
+
+    def fit(self, X, y=None, columns=None):
+        return self
+
+    def transform(self, X):
+        assert isinstance(X, pd.DataFrame)
+        X = pd.get_dummies(X, columns=self.columns, drop_first=True)
+        return pd.DataFrame(X, columns=X.columns)
+
+    def get_feature_names(self):
+        return X.columns.tolist()
+
+# Class to create a pandas version of the sklearn Imputer function
+class ImputerDf(TransformerMixin):
+    def __init__(self, strategy, specific_cols=None, missing_values="NaN"):
+        self.strategy = strategy
+        self.specific_cols = specific_cols
+        self.missing_values = missing_values
+
+    def fit(self, X, y=None):
+        self.old_cols = X.columns
+        if self.specific_cols is None:
+            self.imputer = Imputer(strategy=self.strategy, missing_values=self.missing_values).fit(X)
+        else:
+            self.imputer = Imputer(strategy=self.strategy, missing_values=self.missing_values).fit(np.array(X[self.specific_cols]).reshape(-1,1))
+        return self
+
+    def transform(self, X):
+        if self.specific_cols is None:
+            X = self.imputer.transform(X)
+        else:
+            X[self.specific_cols] = self.imputer.transform(np.array(X[self.specific_cols]).reshape(-1,1))
+        X = pd.DataFrame(X, columns=self.old_cols)
+        return X
+    def get_feature_names(self):
+        return X.columns.tolist()
+
+# Class to create a pandas version of the sklearn StandardScaler function
+class StandardScalerDf(TransformerMixin):
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        old_cols = X.columns
+        #print(X)
+        X = StandardScaler().fit_transform(X)
+        X = pd.DataFrame(X, columns=old_cols)
+        return X
+
+# Class to convert the data type of a specific columns from and to specified data types
+class DtypeConverter(BaseEstimator, TransformerMixin):
+    def __init__(self, from_dtype, to_dtype, col_name=None):
+        self.from_dtype = from_dtype
+        self.to_dtype = to_dtype
+        self.col_name = col_name
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        #assert isinstance(X, pd.DataFrame)
+        if not self.col_name is None:
+            X[self.col_name] = X[self.col_name].astype(self.to_dtype)
+        else:
+            for col in list(X.select_dtypes(include=[self.from_dtype]).columns):
+                X[col] = X[col].astype(self.to_dtype)
+        return X
+
+# Class to overwrite the label from and to specified values
+class OverwriteLabel(BaseEstimator, TransformerMixin):
+    def __init__(self, col_name, from_label, to_label):
+        self.col_name = col_name
+        self.from_label = from_label
+        self.to_label = to_label
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X.loc[X[self.col_name] == self.from_label, self.col_name] = self.to_label
+        return X
+
+# Class to determine the mean encoding value based on cat column and target column
+class MeanEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, category, target, drop_target):
+        self.category = category
+        self.target = target
+        self.drop_target = drop_target
+
+    def fit(self, X, y=None):
+        self.means_dict = {}
+        if isinstance(self.category, list):
+            for i in range(len(self.category)):
+                self.means_dict[self.category[i]] = pd.DataFrame(X.groupby(self.category[i])[self.target].mean())
+                self.means_dict[self.category[i]].columns = ['Mean_' + str(self.category[i])]
+        else:
+            self.means = pd.DataFrame(X.groupby(self.category)[self.target].mean())
+            self.means.columns = ['Mean_' + str(self.category)]
+        return self
+
+    def transform(self, X, y=None):
+        #means = pd.DataFrame(X.groupby(self.category)[self.target].mean())
+        #means.columns = ['Mean_' + str(self.category)]
+        if isinstance(self.category, list):
+            for i in range(len(self.category)):
+                X = pd.merge(X, self.means_dict[self.category[i]], how='left', right_on=self.means_dict[self.category[i]].index, left_on=self.category[i])
+                if self.drop_target:
+                    X = X.drop([self.category[i]], axis=1)
+        else:
+            X = pd.merge(X, self.means, how='left', right_on=self.means.index, left_on=self.category)
+            if self.drop_target:
+                X = X.drop([self.category], axis=1)
+        return X
+
+# Class to extract specified columns for later processing - in_scope bool permits toggle btn chosen and others cols
+class ColumnExtractor(BaseEstimator, TransformerMixin):
+    def __init__(self, cols, in_scope=True):
+        self.cols = cols
+        self.in_scope = in_scope
+        #self.dtype = dtype
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        if self.in_scope:
+            return X[self.cols]
+        else:
+            return X[[col_name for col_name in X.columns if col_name not in self.cols]]
+
+# Class to impute a value based on the groupby average of a specified column
+class ImputeGroupBy(BaseEstimator, TransformerMixin):
+    def __init__(self, grp_col, value_col, strategy='mean'):
+        self.grp_col = grp_col
+        self.value_col = value_col
+        self.strategy = strategy
+
+    def fit(self, X, y=None):
+        if self.strategy == 'mean':
+            self.averages = pd.DataFrame(X.groupby(self.grp_col)[self.value_col].mean())
+
+        elif self.strategy =='median':
+            self.averages = pd.DataFrame(X.groupby(self.grp_col)[self.value_col].median())
+
+        elif self.strategy == 'mode':
+            self.averages = pd.DataFrame(X.groupby(self.grp_col)[self.value_col].mode())
+
+        self.averages.columns = ['Impute_value']
+        return self
+
+    def transform(self, X):
+        for label in list(X[self.grp_col].unique()):
+            missing_condition = (X[self.grp_col] == label) & (X[self.value_col].isnull() == True)
+            if len(missing_condition) > 0:
+                X.loc[missing_condition, self.value_col] = np.float(self.averages[self.averages.index == label]['Impute_value'])
+        return X
+
+# Class to convert a year to an age
+class YearToAge(BaseEstimator, TransformerMixin):
+    def __init__(self, current_year, year_col):
+        self.current_year = current_year
+        self.year_col = year_col
+    def fit(self, X, y=None):
+        return self
+    def transform(self, X):
+        X['Age'] = X[self.year_col].apply(lambda x: np.int(self.current_year) - x)
+        X.drop(self.year_col, axis=1, inplace=True)
+        return X
+
+# Class to impute a categorical label to the most common label in that column
+class CatImputer(BaseEstimator, TransformerMixin):
+    def __init__(self, col_name):
+        self.col_name = col_name
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        if not self.col_name is None:
+            X.loc[X[self.col_name].isnull(), self.col_name] = X[self.col_name].value_counts().index[0]
+        else:
+            X = X.apply(lambda x: x.fillna(x.value_counts().index[0]))
+        return X
+
+# Class to label encode in pandas format
+class LabelEncoderDf(BaseEstimator, TransformerMixin):
+    def __init__(self, col_name):
+        self.col_name = col_name
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X[self.col_name] = LabelEncoder().fit_transform(X[self.col_name])
+        return X
+
+class LabelEncoderSpecific(BaseEstimator, TransformerMixin):
+    def __init__(self, col_to_label, labels):
+        self.labels = labels
+        self.col_to_label = col_to_label
+
+    def fit(self, X, y=None):
+        if isinstance(self.labels, dict):
+            self.labels = pd.DataFrame(self.labels)
+        else:
+            self.labels = self.labels
+        return self
+
+    def transform(self, X):
+        print(self.labels)
+        X = pd.merge(X, self.labels, how='left', on=self.col_to_label)
+        return X
+
+# Class to create the mean ratio of a variable versus itself
+class MeanRatio(BaseEstimator, TransformerMixin):
+    def __init__(self, mean_col, by=None):
+        self.mean_col = mean_col
+        self.by = by
+    def fit(self, X, y=None):
+        if self.by is None:
+            self.mean = X[self.mean_col].mean()
+        else:
+            self.mean = pd.DataFrame(X.groupby(by=self.by)[self.mean_col].mean())
+            self.mean.columns = [self.mean_col + '_Mean_by_' + self.by]
+        return self
+    def transform(self, X):
+        if self.by is None:
+            X[self.mean_col + '_MeanRatio'] = X[self.mean_col] / self.mean
+        else:
+            X = pd.merge(X, self.mean, how='left', left_on=self.by, right_on=self.mean.index)
+            print('Mean column:')
+            print(self.mean_col)
+            print(self.mean)
+            X[self.mean_col + '_MeanRatio_by_' + self.by] = X[self.mean_col] / X[self.mean_col + '_Mean_by_' + self.by]
+            X.drop([self.mean_col + '_Mean_by_' + self.by], axis=1, inplace=True)
+        return X
+
+# Class to select a slice from a string
+class SelectSlice(BaseEstimator, TransformerMixin):
+    def __init__(self, from_index, to_index, from_col_name, new_col_name):
+        self.from_index = from_index
+        self.to_index = to_index
+        self.new_col_name = new_col_name
+        self.from_col_name = from_col_name
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X[self.new_col_name] = X[self.from_col_name].apply(lambda x: x[self.from_index : self.to_index])
+        return X
+
+# Class to drop a column
+class ColumnDrop(BaseEstimator, TransformerMixin):
+    def __init__(self, col_name):
+        self.col_name = col_name
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.drop(self.col_name, axis=1)
+        return X
+
+# Class to derive target based summary stats for chosen categorical variable
+class GetTargetStatsBy(BaseEstimator, TransformerMixin):
+    def __init__(self,  by_var_name, target):
+        #self.map_df = map_df
+        #self.train_df = train_df
+        self.by_var_name = by_var_name
+        self.target = target
+
+    def fit(self, X, y=None):
+        self.grouped_df = X.groupby(self.by_var_name)
+        self.min_dict = {}
+        self.max_dict = {}
+        self.mean_dict = {}
+        self.twentyfive_dict = {}
+        self.seventyfive_dict = {}
+        for name, group in self.grouped_df:
+            self.min_dict[name] = min(np.array(group[self.target]))
+            self.max_dict[name] = max(np.array(group[self.target]))
+            self.mean_dict[name] = np.mean(np.array(group[self.target]))
+            self.twentyfive_dict[name] = np.percentile(np.array(group[self.target]), 25)
+            self.seventyfive_dict[name] = np.percentile(np.array(group[self.target]), 75)
+        return self
+
+    def transform(self, X):
+        self.min_list = []
+        self.max_list = []
+        self.mean_list = []
+        self.twentyfive_list = []
+        self.seventyfive_list = []
+        for index, row in X.iterrows():
+            name = row[self.by_var_name]
+            self.min_list.append(self.min_dict.get(name, 0))
+            self.max_list.append(self.max_dict.get(name, 0))
+            self.mean_list.append(self.mean_dict.get(name, 0))
+            self.twentyfive_list.append(self.twentyfive_dict.get(name, 0))
+            self.seventyfive_list.append(self.seventyfive_dict.get(name, 0))
+
+        X[self.by_var_name + '_Min' + target] = self.min_list
+        X[self.by_var_name + '_Max' + target] = self.max_list
+        X[self.by_var_name + '_Mean' + target] = self.mean_list
+        X[self.by_var_name + '_25Perc' + target] = self.twentyfive_list
+        X[self.by_var_name + '_75Perc' + target] = self.seventyfive_list
+
+        return X
+
+# Class to have a Pandas version of the FeatureUnion method
+from sklearn.externals.joblib import Parallel, delayed
+from sklearn.pipeline import FeatureUnion, _fit_transform_one, _transform_one
+from scipy import sparse
+class PandasFeatureUnion(FeatureUnion):
+    def fit_transform(self, X, y=None, **fit_params):
+        self._validate_transformers()
+        result = Parallel(n_jobs=self.n_jobs)(
+            delayed(_fit_transform_one)(
+                transformer=trans,
+                X=X,
+                y=y,
+                weight=weight,
+                **fit_params)
+            for name, trans, weight in self._iter())
+
+        if not result:
+            # All transformers are None
+            return np.zeros((X.shape[0], 0))
+        Xs, transformers = zip(*result)
+        self._update_transformer_list(transformers)
+        if any(sparse.issparse(f) for f in Xs):
+            Xs = sparse.hstack(Xs).tocsr()
+        else:
+            Xs = self.merge_dataframes_by_column(Xs)
+        return Xs
+
+    def merge_dataframes_by_column(self, Xs):
+        return pd.concat(Xs, axis="columns", copy=False)
+
+    def transform(self, X):
+        Xs = Parallel(n_jobs=self.n_jobs)(
+            delayed(_transform_one)(
+                transformer=trans,
+                X=X,
+                y=None,
+                weight=weight)
+            for name, trans, weight in self._iter())
+        if not Xs:
+            # All transformers are None
+            return np.zeros((X.shape[0], 0))
+        if any(sparse.issparse(f) for f in Xs):
+            Xs = sparse.hstack(Xs).tocsr()
+        else:
+            Xs = self.merge_dataframes_by_column(Xs)
+        return Xs
+
